@@ -1,11 +1,16 @@
 package com.newhires.camera;
 
+import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.app.DatePickerDialog;
 import android.content.ActivityNotFoundException;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.database.Cursor;
+import android.os.Build;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.net.Uri;
@@ -27,7 +32,11 @@ import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.Calendar;
 import java.util.Date;
 import java.util.Locale;
@@ -89,6 +98,23 @@ public class MainActivity extends Activity {
             if (u != null) pendingUri = Uri.parse(u);
             pendingFileName = savedInstanceState.getString("pendingFileName");
         }
+        askReadPermission();
+        refreshToday();
+    }
+
+    // Lets the app see photos saved by older installs of the app too.
+    private void askReadPermission() {
+        String perm = Build.VERSION.SDK_INT >= 33
+                ? "android.permission.READ_MEDIA_IMAGES"
+                : Manifest.permission.READ_EXTERNAL_STORAGE;
+        if (checkSelfPermission(perm) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{perm}, 2);
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         refreshToday();
     }
 
@@ -158,6 +184,14 @@ public class MainActivity extends Activity {
         lp.topMargin = dp(20);
         shoot.setOnClickListener(v -> capture());
         root.addView(shoot, lp);
+
+        Button sheet = new Button(this);
+        sheet.setText("شيت إكسل من تاريخ لتاريخ");
+        sheet.setTextSize(16);
+        LinearLayout.LayoutParams lp2 = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(54));
+        lp2.topMargin = dp(10);
+        sheet.setOnClickListener(v -> pickDateForSheet());
+        root.addView(sheet, lp2);
 
         root.addView(label("اتصوروا النهارده"));
         todayList = new TextView(this);
@@ -289,6 +323,136 @@ public class MainActivity extends Activity {
         }
 
         todayList.setText(count == 0 ? "لسه محدش اتصور النهارده" : sb.toString().trim());
+    }
+
+    // ---------- Excel sheet for a day ----------
+
+    private static final Pattern FILE_PATTERN =
+            Pattern.compile("^(.*) - (.*) - (\\d{2}-\\d{2}-\\d{4})(?: ?\\(\\d+\\))?\\.jpe?g$", Pattern.CASE_INSENSITIVE);
+
+    private void pickDateForSheet() {
+        Calendar now = Calendar.getInstance();
+        DatePickerDialog from = new DatePickerDialog(this, (v1, y1, m1, d1) -> {
+            Calendar start = Calendar.getInstance();
+            start.set(y1, m1, d1);
+            DatePickerDialog to = new DatePickerDialog(this, (v2, y2, m2, d2) -> {
+                Calendar end = Calendar.getInstance();
+                end.set(y2, m2, d2);
+                if (end.before(start)) exportSheet(end, start);
+                else exportSheet(start, end);
+            }, y1, m1, d1);
+            to.setTitle("إلى تاريخ");
+            to.show();
+        }, now.get(Calendar.YEAR), now.get(Calendar.MONTH), now.get(Calendar.DAY_OF_MONTH));
+        from.setTitle("من تاريخ");
+        from.show();
+    }
+
+    private static int dayKey(Calendar c) {
+        return c.get(Calendar.YEAR) * 10000 + (c.get(Calendar.MONTH) + 1) * 100 + c.get(Calendar.DAY_OF_MONTH);
+    }
+
+    // "dd-MM-yyyy" -> yyyymmdd
+    private static int dayKey(String ddMMyyyy) {
+        String[] p = ddMMyyyy.split("-");
+        return Integer.parseInt(p[2]) * 10000 + Integer.parseInt(p[1]) * 100 + Integer.parseInt(p[0]);
+    }
+
+    private static String csv(String v) {
+        return "\"" + (v == null ? "" : v.replace("\"", "\"\"")) + "\"";
+    }
+
+    private void exportSheet(Calendar start, Calendar end) {
+        SimpleDateFormat dayFmt = new SimpleDateFormat("dd-MM-yyyy", Locale.US);
+        String fromText = dayFmt.format(start.getTime());
+        String toText = dayFmt.format(end.getTime());
+        int fromKey = dayKey(start), toKey = dayKey(end);
+        boolean oneDay = fromKey == toKey;
+        String rangeText = oneDay ? "يوم " + fromText : "من " + fromText + " إلى " + toText;
+
+        java.util.List<String[]> rows = new java.util.ArrayList<>();   // name, dept, date, time, sortKey
+        SimpleDateFormat timeFmt = new SimpleDateFormat("HH:mm", Locale.US);
+        String[] projection = {MediaStore.Images.Media.DISPLAY_NAME, MediaStore.Images.Media.DATE_ADDED};
+        String selection = MediaStore.Images.Media.RELATIVE_PATH + "=?";
+        String[] args = {FOLDER};
+
+        try (Cursor cur = getContentResolver().query(
+                MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+                projection, selection, args, MediaStore.Images.Media.DATE_ADDED + " ASC")) {
+            if (cur != null) {
+                while (cur.moveToNext()) {
+                    String fileName = cur.getString(0);
+                    if (fileName == null) continue;
+                    Matcher m = FILE_PATTERN.matcher(fileName);
+                    if (!m.matches()) continue;
+                    int key = dayKey(m.group(3));
+                    if (key < fromKey || key > toKey) continue;
+                    long added = cur.getLong(1);
+                    rows.add(new String[]{
+                            m.group(1).trim(), m.group(2).trim(), m.group(3),
+                            timeFmt.format(new Date(added * 1000L)),
+                            String.format(Locale.US, "%08d%012d", key, added)});
+                }
+            }
+        } catch (Exception e) {
+            toast("حصلت مشكلة وأنا بقرا الصور");
+            return;
+        }
+
+        if (rows.isEmpty()) {
+            toast("مفيش حد اتصور " + rangeText);
+            return;
+        }
+        rows.sort((x, y) -> x[4].compareTo(y[4]));
+
+        StringBuilder sb = new StringBuilder();
+        sb.append('\uFEFF');
+        sb.append(csv("م")).append(',').append(csv("الاسم")).append(',').append(csv("القسم")).append(',')
+          .append(csv("تاريخ التعيين")).append(',').append(csv("الساعة")).append("\r\n");
+        int count = 0;
+        for (String[] r : rows) {
+            count++;
+            sb.append(count).append(',').append(csv(r[0])).append(',').append(csv(r[1])).append(',')
+              .append(csv(r[2])).append(',').append(csv(r[3])).append("\r\n");
+        }
+
+        String sheetName = oneDay ? "NewHires " + fromText + ".csv" : "NewHires " + fromText + " to " + toText + ".csv";
+        ContentValues values = new ContentValues();
+        values.put(MediaStore.Downloads.DISPLAY_NAME, sheetName);
+        values.put(MediaStore.Downloads.MIME_TYPE, "text/csv");
+        values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/NewHires/");
+
+        Uri uri;
+        try {
+            uri = getContentResolver().insert(MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values);
+            if (uri == null) throw new Exception();
+            try (OutputStream out = getContentResolver().openOutputStream(uri)) {
+                out.write(sb.toString().getBytes(StandardCharsets.UTF_8));
+            }
+        } catch (Exception e) {
+            toast("مش قادر أحفظ الشيت");
+            return;
+        }
+
+        final Uri sheetUri = uri;
+        new AlertDialog.Builder(this)
+                .setTitle("الشيت جاهز")
+                .setMessage("فيه " + count + " موظف اتعينوا " + rangeText + ".\nاتحفظ في Download/NewHires على الموبايل.")
+                .setPositiveButton("ابعته", (d, w) -> shareSheet(sheetUri))
+                .setNegativeButton("تمام", null)
+                .show();
+    }
+
+    private void shareSheet(Uri uri) {
+        Intent send = new Intent(Intent.ACTION_SEND);
+        send.setType("text/csv");
+        send.putExtra(Intent.EXTRA_STREAM, uri);
+        send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        try {
+            startActivity(Intent.createChooser(send, "ابعت الشيت"));
+        } catch (ActivityNotFoundException e) {
+            toast("مفيش أبلكيشن يقدر يبعت الملف");
+        }
     }
 
     private void toast(String msg) {
